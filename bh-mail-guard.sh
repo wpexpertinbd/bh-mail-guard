@@ -64,6 +64,12 @@
 #      maillog for a day, THEN roll to the fleet. postscreen edits
 #      master.cf (the riskiest change) — prefer a low-traffic window.
 #
+#  v1.0.1 (2026-06-06) — greylist robustness (first live deploy on
+#    biswashost). postgrey now runs in INET mode via a systemd drop-in
+#    (unix-socket mode silently failed to start on CWP). Added
+#    smtpd_policy_service_default_action=DUNNO (fail-open: a dead policy
+#    service must never 451-defer legit mail) + stale unix-socket
+#    cleanup in both the greylist phase and the heal cron.
 #  v1.0 (2026-06-06) — initial build.
 # ================================================================
 
@@ -185,6 +191,15 @@ pc_append_tokens() {
     return 0
   fi
   return 1
+}
+
+pc_strip_token() {
+  # pc_strip_token KEY "exact entry"  — remove one comma-list entry if present
+  local key="$1" sub="$2" out
+  pc_get "$key" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -qxF "$sub" || return 0
+  out="$(pc_get "$key" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -vxF "$sub" | paste -sd, - | sed 's/,/, /g')"
+  "$POSTCONF" -e "$key=$out"
+  logf "main.cf strip '$sub' from $key"
 }
 
 backup_once() {
@@ -377,24 +392,37 @@ WL
   hostname -d >/dev/null 2>&1 && echo ".$(hostname -d)" >> "$wlf"
   ok "ESP/provider whitelist written: $wlf"
 
-  # Point postgrey at this local whitelist (EL unit reads /etc/sysconfig/postgrey OPTIONS)
-  local sysc=/etc/sysconfig/postgrey
-  backup_once "$sysc"
-  cat > "$sysc" <<EOF
-# BH-MAIL-GUARD managed
-OPTIONS="--unix=/var/spool/postfix/postgrey/socket --delay=$GREYLIST_DELAY --max-age=$GREYLIST_MAX_AGE --whitelist-clients=$wlf"
+  # Run postgrey in INET mode via a systemd drop-in. On CWP this is far more
+  # robust than the unix socket — the unix-socket mode silently failed to
+  # start on the first biswashost deploy (chroot/SELinux/socket-dir pitfalls).
+  # postgrey auto-reads BOTH postgrey_whitelist_clients and *.local, so the
+  # ESP whitelist above is picked up without a flag.
+  mkdir -p /var/run/postgrey && chown postgrey:postgrey /var/run/postgrey 2>/dev/null || true
+  mkdir -p /etc/systemd/system/postgrey.service.d
+  cat > /etc/systemd/system/postgrey.service.d/bh-override.conf <<EOF
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/postgrey --inet=127.0.0.1:$POSTGREY_PORT --delay=$GREYLIST_DELAY --max-age=$GREYLIST_MAX_AGE --pidfile=/var/run/postgrey/postgrey.pid -d
 EOF
-  # Some EL postgrey units use --inet; provide both — prefer unix socket.
+  systemctl daemon-reload
   systemctl enable postgrey >/dev/null 2>&1 || true
-  systemctl restart postgrey 2>/dev/null || systemctl start postgrey 2>/dev/null || warn "could not start postgrey service"
+  systemctl restart postgrey 2>/dev/null || systemctl start postgrey 2>/dev/null || true
+  if ss -ltn 2>/dev/null | grep -q "127.0.0.1:$POSTGREY_PORT\b"; then
+    ok "postgrey listening on 127.0.0.1:$POSTGREY_PORT (delay=${GREYLIST_DELAY}s, max-age=${GREYLIST_MAX_AGE}d)"
+  else
+    warn "postgrey not listening yet — check: journalctl -u postgrey | tail"
+    warn "(mail still flows — policy service is fail-open, set below)"
+  fi
 
-  # Wire into recipient restrictions (at END, after reject_unauth_destination).
-  # Prefer the unix socket the service is bound to.
-  local socket="unix:postgrey/socket"
-  systemctl show postgrey 2>/dev/null | grep -q "inet=$POSTGREY_PORT" && socket="inet:127.0.0.1:$POSTGREY_PORT"
   backup_once "$MAIN_CF"
-  pc_append_tokens smtpd_recipient_restrictions "check_policy_service $socket" || true
-  ok "greylisting wired: delay=${GREYLIST_DELAY}s, max-age=${GREYLIST_MAX_AGE}d, whitelist active"
+  # Fail-open: an unreachable policy service returns DUNNO instead of
+  # 451-deferring legit mail. Same philosophy as milter_default_action=accept.
+  pc_set smtpd_policy_service_default_action "DUNNO" || true
+  # Drop any stale unix-socket policy line from an earlier run (we use inet now).
+  pc_strip_token smtpd_recipient_restrictions "check_policy_service unix:postgrey/socket"
+  # Wire into recipient restrictions at the END (after anti-relay). Always inet.
+  pc_append_tokens smtpd_recipient_restrictions "check_policy_service inet:127.0.0.1:$POSTGREY_PORT" || true
+  ok "greylisting wired (inet:127.0.0.1:$POSTGREY_PORT) — fail-open enabled"
 
   validate_and_reload
   save_state
@@ -535,6 +563,7 @@ GREYLIST_DELAY=$GREYLIST_DELAY
 GREYLIST_MAX_AGE=$GREYLIST_MAX_AGE
 DMARC_REJECT=$DMARC_REJECT
 OPENDMARC_PORT=$OPENDMARC_PORT
+POSTGREY_PORT=$POSTGREY_PORT
 HAS_POSTGREY=$HAS_POSTGREY
 HAS_OPENDMARC=$HAS_OPENDMARC
 EOF
@@ -598,11 +627,16 @@ pc_app smtpd_sender_restrictions "permit_sasl_authenticated reject_non_fqdn_send
 pc_app smtpd_recipient_restrictions "reject_non_fqdn_recipient reject_unknown_recipient_domain reject_unauth_destination reject_unknown_reverse_client_hostname" permit_mynetworks
 pc_app smtpd_data_restrictions "reject_unauth_pipelining"
 
-# greylist policy service
+# greylist policy service (always inet; fail-open so a dead service never defers mail)
 if [ "${HAS_POSTGREY:-0}" = "1" ]; then
-  SOCK="unix:postgrey/socket"
-  systemctl show postgrey 2>/dev/null | grep -q "inet=10023" && SOCK="inet:127.0.0.1:10023"
-  pc_app smtpd_recipient_restrictions "check_policy_service $SOCK"
+  PGP="${POSTGREY_PORT:-10023}"
+  pc_set smtpd_policy_service_default_action DUNNO
+  # strip any stale unix-socket entry a CWP rebuild may have re-templated
+  if pc_get smtpd_recipient_restrictions | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -qxF "check_policy_service unix:postgrey/socket"; then
+    NL="$(pc_get smtpd_recipient_restrictions | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -vxF "check_policy_service unix:postgrey/socket" | paste -sd, - | sed 's/,/, /g')"
+    "$POSTCONF" -e "smtpd_recipient_restrictions=$NL"; CHANGED=1; log "stripped stale unix postgrey socket"
+  fi
+  pc_app smtpd_recipient_restrictions "check_policy_service inet:127.0.0.1:$PGP"
 fi
 
 # dmarc milter

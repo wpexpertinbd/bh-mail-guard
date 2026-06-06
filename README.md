@@ -102,6 +102,13 @@ minutes. Desired state lives in `/var/lib/bh-mail-guard/desired.env`.
   Mailgun, SparkPost, Postmark, Mailchimp) and big providers (Gmail, Outlook,
   Yahoo, Zoho) are whitelisted in `/etc/postfix/postgrey_whitelist_clients.local`
   so order-confirmation mail is never delayed. Add more there as needed.
+- **postgrey runs in INET mode** (`127.0.0.1:10023`) via a systemd drop-in at
+  `/etc/systemd/system/postgrey.service.d/bh-override.conf` — the unix-socket
+  mode silently failed to start on CWP (chroot/SELinux/socket-dir pitfalls).
+  Verify with `ss -ltn | grep 10023` and `systemctl is-active postgrey`.
+- **Fail-open policy service:** `smtpd_policy_service_default_action = DUNNO`
+  is set so that if postgrey (or Policyd) is ever unreachable, mail is accepted
+  rather than 451-deferred. Availability over strictness.
 - **Train Bayes** for faster accuracy gains:
   `sa-learn --spam /path/to/Junk` and `sa-learn --ham /path/to/INBOX`.
 
