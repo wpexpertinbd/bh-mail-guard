@@ -64,6 +64,11 @@
 #      maillog for a day, THEN roll to the fleet. postscreen edits
 #      master.cf (the riskiest change) — prefer a low-traffic window.
 #
+#  v1.0.7 (2026-06-06) — sa-tune now VERIFIES amavisd actually started after
+#    the restart (it used to print "restarted" blindly). On IPv6-disabled CWP
+#    boxes amavis 2.13 fails to bind ::1:10024 and stays down silently while
+#    postfix queues all inbound mail — now flagged loudly with the IPv4-bind
+#    fix ($inet_socket_bind='127.0.0.1'; $inet_socket_port=10024). Hit on s4.
 #  v1.0.6 (2026-06-06) — KAM network calls can no longer hang the deploy.
 #    Added curl --connect-timeout/--max-time + wget --timeout on the key
 #    fetch, and `timeout 180` on sa-update (hit on s4 — a slow route to
@@ -631,10 +636,28 @@ SACF
     fi
   fi
 
-  # restart whatever actually runs SA
+  # restart whatever actually runs SA — then VERIFY amavis actually came up.
+  # On IPv6-disabled CWP boxes, amavis 2.13 tries to bind ::1:10024, fails
+  # ("Cannot assign requested address"), and stays down — postfix then quietly
+  # queues all inbound mail. Don't report success blindly (we used to).
   systemctl restart spamassassin 2>/dev/null || true
-  systemctl restart amavisd 2>/dev/null || systemctl restart amavis 2>/dev/null || true
-  ok "restarted SpamAssassin/Amavis consumers"
+  if systemctl list-unit-files 2>/dev/null | grep -q '^amavisd'; then
+    systemctl restart amavisd 2>/dev/null || true
+    sleep 2
+    if systemctl is-active --quiet amavisd; then
+      ok "restarted SpamAssassin + amavisd (amavisd active, listening 10024)"
+    else
+      err "amavisd FAILED to start — inbound mail will queue until fixed."
+      warn "If maillog shows \"Can't ... port 10024 on ::1 [Cannot assign requested address]\","
+      warn "this box has IPv6 off and amavis 2.13 can't bind ::1. Fix in /etc/amavisd/amavisd.conf:"
+      warn "    \$inet_socket_bind = '127.0.0.1';"
+      warn "    \$inet_socket_port = 10024;"
+      warn "then:  systemctl restart amavisd && postqueue -f"
+    fi
+  else
+    systemctl restart amavis 2>/dev/null || true
+    ok "restarted SpamAssassin/Amavis consumers"
+  fi
   echo
   say "Tip: train Bayes faster by feeding known spam/ham:"
   say "  sa-learn --spam /path/to/Junk    # per-mailbox spam folders"
