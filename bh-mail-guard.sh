@@ -64,6 +64,12 @@
 #      maillog for a day, THEN roll to the fleet. postscreen edits
 #      master.cf (the riskiest change) — prefer a low-traffic window.
 #
+#  v1.0.3 (2026-06-06) — status display fixes (cosmetic). grep -c already
+#    prints 0 on no match, so the `|| echo 0` double-printed; replaced with a
+#    `cnt()` helper (`|| true`). Top-rejected-IPs now scans ALL reject layers
+#    (reverse-DNS/HELO/blocked-using), not just postscreen. First live deploy
+#    on biswashost confirmed working: 105 HELO + 93 rDNS rejects + 802
+#    greylist deferrals within minutes; all 5 services active.
 #  v1.0.2 (2026-06-06) — CRITICAL restriction-list fix + postgrey start fix.
 #    (a) The token-list helper normalized commas→spaces then spaces→commas,
 #        which SPLIT multi-word entries like `check_policy_service inet:...`
@@ -727,15 +733,18 @@ phase_status() {
   if [ ! -f "$ml" ]; then warn "no maillog found"; return 0; fi
   say "Reading $ml (today)…"
   local today; today="$(date '+%b %e')"
+  # grep -c already prints 0 on no match — `|| true` swallows the exit-1 so we
+  # don't double-print a second 0 (the cosmetic v1.0.2 bug). Use -E patterns.
+  cnt() { grep -cE "$1" "$ml" 2>/dev/null || true; }
   echo
-  printf "  %-34s %s\n" "postscreen DNSBL rejects:"   "$(grep -c "postscreen.*DNSBL rank" "$ml" 2>/dev/null || echo 0)"
-  printf "  %-34s %s\n" "postscreen pregreet rejects:" "$(grep -c "postscreen.*PREGREET" "$ml" 2>/dev/null || echo 0)"
-  printf "  %-34s %s\n" "HELO/FQDN rejects:"          "$(grep -cE 'reject.*(helo|HELO|non-FQDN|FQDN)' "$ml" 2>/dev/null || echo 0)"
-  printf "  %-34s %s\n" "unknown-domain rejects:"     "$(grep -c 'Sender address rejected.*Domain not found\|Recipient address rejected.*Domain not found' "$ml" 2>/dev/null || echo 0)"
-  printf "  %-34s %s\n" "reverse-DNS rejects:"        "$(grep -c 'reject.*Client host rejected.*cannot find' "$ml" 2>/dev/null || echo 0)"
-  printf "  %-34s %s\n" "greylist deferrals (451):"   "$(grep -c 'Greylisting in action\|postgrey' "$ml" 2>/dev/null || echo 0)"
-  printf "  %-34s %s\n" "SpamAssassin tagged spam:"   "$(grep -c 'Passed SPAM\|identified as spam' "$ml" 2>/dev/null || echo 0)"
-  printf "  %-34s %s\n" "amavis clean passes:"        "$(grep -c 'Passed CLEAN' "$ml" 2>/dev/null || echo 0)"
+  printf "  %-34s %s\n" "postscreen DNSBL rejects:"    "$(cnt 'postscreen.*blocked using|postscreen.*DNSBL rank [0-9]+ for.*reject')"
+  printf "  %-34s %s\n" "postscreen pregreet rejects:" "$(cnt 'postscreen.*PREGREET')"
+  printf "  %-34s %s\n" "HELO/FQDN rejects:"           "$(cnt 'reject.*(helo|HELO|non-FQDN|FQDN)')"
+  printf "  %-34s %s\n" "unknown-domain rejects:"      "$(cnt '(Sender|Recipient) address rejected.*Domain not found')"
+  printf "  %-34s %s\n" "reverse-DNS rejects:"         "$(cnt 'reject.*Client host rejected.*cannot find')"
+  printf "  %-34s %s\n" "greylist deferrals (451):"    "$(cnt 'Greylisting in action|postgrey')"
+  printf "  %-34s %s\n" "SpamAssassin tagged spam:"    "$(cnt 'Passed SPAM|identified as spam')"
+  printf "  %-34s %s\n" "amavis clean passes:"         "$(cnt 'Passed CLEAN')"
   echo
   say "Services:"
   for s in postfix postgrey opendmarc spamassassin amavisd; do
@@ -744,9 +753,10 @@ phase_status() {
     fi
   done
   echo
-  say "Top 10 rejected client IPs today:"
-  grep "$today" "$ml" 2>/dev/null | grep -oE 'postscreen.*\[[0-9.]+\].*(DNSBL|PREGREET)' \
-    | grep -oE '\[[0-9.]+\]' | sort | uniq -c | sort -rn | head -10 | sed 's/^/    /' || true
+  say "Top 10 rejected client IPs today (all reject layers):"
+  grep "$today" "$ml" 2>/dev/null | grep -E 'reject:|blocked using|PREGREET' \
+    | grep -oE '\[[0-9]{1,3}(\.[0-9]{1,3}){3}\]' | tr -d '[]' \
+    | sort | uniq -c | sort -rn | head -10 | sed 's/^/    /' || true
   echo
   say "Heal cron: $([ -f /etc/cron.d/bh-mail-guard-heal ] && echo "${c_ok}installed${c_off}" || echo "not installed")"
 }
