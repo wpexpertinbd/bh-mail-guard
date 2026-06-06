@@ -64,6 +64,10 @@
 #      maillog for a day, THEN roll to the fleet. postscreen edits
 #      master.cf (the riskiest change) — prefer a low-traffic window.
 #
+#  v1.0.5 (2026-06-06) — fix KAM key URL. McGrail renamed the key in 2026;
+#    the old downloads/MCGRAIL-GPG.KEY now 404s (confirmed on the fleet).
+#    Correct URL: downloads/kam.sa-channels.mcgrail.com.key (key id 24C063D8,
+#    fpr 21D9 7142 272C 9066 FCAA 792B 4A15 6DA5 24C0 63D8).
 #  v1.0.4 (2026-06-06) — robust + self-diagnosing KAM ruleset import. Now
 #    validates the downloaded key is a real PGP block (a 404 HTML page was
 #    silently breaking --import), captures + prints the real error, and
@@ -580,8 +584,10 @@ SACF
   if [ "$INSTALL_KAM" = "1" ]; then
     if command -v sa-update >/dev/null 2>&1; then
       local kamkey=/tmp/bhmg-kam.key kam_ok=0
-      curl -fsSL --retry 3 https://mcgrail.com/downloads/MCGRAIL-GPG.KEY -o "$kamkey" 2>/tmp/bhmg-kam.err \
-        || wget -qO "$kamkey" https://mcgrail.com/downloads/MCGRAIL-GPG.KEY 2>>/tmp/bhmg-kam.err || true
+      # McGrail renamed the key file in 2026 (old MCGRAIL-GPG.KEY now 404).
+      local kamurl="https://mcgrail.com/downloads/kam.sa-channels.mcgrail.com.key"
+      curl -fsSL --retry 3 "$kamurl" -o "$kamkey" 2>/tmp/bhmg-kam.err \
+        || wget -qO "$kamkey" "$kamurl" 2>>/tmp/bhmg-kam.err || true
       if grep -q 'BEGIN PGP' "$kamkey" 2>/dev/null; then
         if sa-update --import "$kamkey" 2>/tmp/bhmg-kam.err; then
           ok "imported KAM GPG key (24C063D8)"; kam_ok=1
