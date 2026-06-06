@@ -38,7 +38,16 @@ cd /root && git clone https://github.com/wpexpertinbd/bh-mail-guard.git
 cd bh-mail-guard
 ```
 
-To pull later updates: `cd /root/bh-mail-guard && git pull`.
+## Update (already cloned)
+
+Don't re-clone — `git clone` fails if the folder exists. Pull inside it:
+
+```bash
+cd /root/bh-mail-guard && git pull
+```
+
+> All commands below must be run **from inside `/root/bh-mail-guard`**
+> (`cd /root/bh-mail-guard` first), since that's where the scripts live.
 
 ## Usage
 
@@ -74,6 +83,7 @@ DNSBL lookups resolve and botnets get rejected at connect time — the cheapest
 layer of all.
 
 ```bash
+cd /root/bh-mail-guard          # the scripts live here
 bash bh-resolver.sh detect      # read-only: live DNSBL test on the current resolver
 bash bh-resolver.sh install     # install unbound + repoint resolv.conf (interactive)
 bash bh-resolver.sh status
