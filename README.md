@@ -103,6 +103,37 @@ everything):
 
 If `detect` shows DNSBL lookups already work on a box, no change is needed there.
 
+## Full deploy — one block per box (mail guard + resolver + KAM)
+
+The complete fleet rollout for a box: clone (or pull), install the locked
+local resolver, then apply every mail-guard layer (KAM rules included).
+
+**New box (not yet cloned):**
+
+```bash
+cd /root && git clone https://github.com/wpexpertinbd/bh-mail-guard.git && \
+cd bh-mail-guard && \
+STICKY=1 bash bh-resolver.sh install && \
+bash bh-mail-guard.sh all -y
+```
+
+**Already cloned (update + (re)apply everything):**
+
+```bash
+cd /root/bh-mail-guard && git pull && \
+STICKY=1 bash bh-resolver.sh install && \
+bash bh-mail-guard.sh all -y
+```
+
+Then confirm:
+
+```bash
+bash bh-mail-guard.sh status   # 'postscreen DNSBL rejects' should climb above 0
+```
+
+`STICKY=1` makes `resolv.conf` immutable so a reboot / NetworkManager can't
+silently revert the DNSBL fix. Everything is idempotent — safe to re-run.
+
 ### Env toggles
 
 | Var | Default | Effect |
