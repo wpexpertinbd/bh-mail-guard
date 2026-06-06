@@ -187,7 +187,8 @@ phase_install() {
     echo "options edns0 trust-ad"
   } > "${RESOLV}.bhmg-new"
   cat "${RESOLV}.bhmg-new" > "$RESOLV" && rm -f "${RESOLV}.bhmg-new"
-  ok "resolv.conf now points at $UB_ADDR (fallback: ${oldns:-none})"
+  local oldns_disp; oldns_disp="$(echo "$oldns" | tr '\n' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//; s/ /, /g')"
+  ok "resolv.conf now points at $UB_ADDR (fallback: ${oldns_disp:-none})"
 
   if [ "$STICKY" = "1" ]; then
     chattr +i "$RESOLV" 2>/dev/null && ok "resolv.conf set immutable (STICKY=1) — survives NM/dhclient" \
