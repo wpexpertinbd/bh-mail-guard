@@ -1,0 +1,5 @@
+*.bak*
+*.bh-bak-*
+*.swp
+.DS_Store
+/tmp/
