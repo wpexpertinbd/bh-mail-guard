@@ -41,6 +41,8 @@
 #    UB_ADDR=127.0.0.53   loopback address unbound binds (default).
 #
 #  Idempotent. Safe to re-run. Pairs with bh-mail-guard.sh.
+#  v1.0.1 (2026-06-06) — a plain re-run no longer un-sticks resolv.conf: if it
+#    was already immutable, the lock is preserved even without STICKY=1.
 #  v1.0 (2026-06-06)
 # ================================================================
 set -e
@@ -178,7 +180,12 @@ phase_install() {
 
   # ── Repoint resolv.conf (unbound primary, old resolver kept as fallback) ──
   [ -f "${RESOLV}.bh-bak-${RUNSTAMP}" ] || cp -a "$RESOLV" "${RESOLV}.bh-bak-${RUNSTAMP}" 2>/dev/null || true
-  chattr -i "$RESOLV" 2>/dev/null || true   # in case a prior run made it immutable
+  # Remember if it was already locked, so a plain re-run doesn't silently
+  # un-stick it (a STICKY=1 install followed by a non-STICKY re-run otherwise
+  # removed the lock — observed on s4).
+  local was_immutable=0
+  lsattr "$RESOLV" 2>/dev/null | awk '{print $1}' | grep -q 'i' && was_immutable=1
+  chattr -i "$RESOLV" 2>/dev/null || true   # must clear to rewrite; re-applied below
   local oldns; oldns="$(current_ns | grep -v "^${UB_ADDR}$" | head -2)"
   {
     echo "# BH-RESOLVER managed — local unbound resolver (DNSBL-capable). $RUNSTAMP"
@@ -190,8 +197,9 @@ phase_install() {
   local oldns_disp; oldns_disp="$(echo "$oldns" | tr '\n' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//; s/ /, /g')"
   ok "resolv.conf now points at $UB_ADDR (fallback: ${oldns_disp:-none})"
 
-  if [ "$STICKY" = "1" ]; then
-    chattr +i "$RESOLV" 2>/dev/null && ok "resolv.conf set immutable (STICKY=1) — survives NM/dhclient" \
+  if [ "$STICKY" = "1" ] || [ "$was_immutable" = "1" ]; then
+    chattr +i "$RESOLV" 2>/dev/null \
+      && ok "resolv.conf set immutable ($([ "$STICKY" = 1 ] && echo "STICKY=1" || echo "kept prior lock")) — survives NM/dhclient" \
       || warn "could not set immutable flag on $RESOLV"
   else
     say "  (tip: STICKY=1 makes resolv.conf immutable so NM/dhclient can't revert it)"
