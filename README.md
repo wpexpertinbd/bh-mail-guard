@@ -29,6 +29,17 @@ layer that rejects botnets at the front door. That's the gap this closes.
 
 Each layer shrinks the next layer's workload.
 
+## Install
+
+SSH into the mail server as root and clone the repo (no manual file upload):
+
+```bash
+cd /root && git clone https://github.com/wpexpertinbd/bh-mail-guard.git
+cd bh-mail-guard
+```
+
+To pull later updates: `cd /root/bh-mail-guard && git pull`.
+
 ## Usage
 
 ```bash
@@ -38,15 +49,20 @@ bash bh-mail-guard.sh detect
 # 2. Full recommended deployment (interactive confirm)
 bash bh-mail-guard.sh all
 
-#    non-interactive (fleet rollout, after testing on one box)
-bash bh-mail-guard.sh all -y
-
 # 3. After a few hours, check the counters
 bash bh-mail-guard.sh status
 ```
 
-Run individual phases too: `postscreen`, `restrictions`, `greylist`, `dmarc`,
-`sa-tune`, `heal-install`, `status`.
+One-liner for a clean box (clone + inspect + deploy non-interactively):
+
+```bash
+cd /root && git clone https://github.com/wpexpertinbd/bh-mail-guard.git && \
+cd bh-mail-guard && bash bh-mail-guard.sh detect && bash bh-mail-guard.sh all -y
+```
+
+`-y` skips the interactive confirm — use it for fleet rollout after you've
+tested on one box. Run individual phases too: `postscreen`, `restrictions`,
+`greylist`, `dmarc`, `sa-tune`, `heal-install`, `status`.
 
 ### Env toggles
 
@@ -123,10 +139,11 @@ systemctl restart postfix
 
 ## Deploy checklist
 
-1. `detect` on the target box.
+1. `git clone` + `detect` on the target box.
 2. Deploy on **one** server first, ideally in a low-traffic window
    (postscreen edits `master.cf` — the riskiest change).
 3. `tail -f /var/log/maillog | grep -E 'postscreen|reject|postgrey'` and watch
    for an hour — confirm legit mail flows.
 4. `status` after a few hours.
-5. Roll to the rest of the fleet with `all -y`.
+5. Roll to the rest of the fleet: on each box, clone the repo and run
+   `bash bh-mail-guard.sh detect && bash bh-mail-guard.sh all -y`.
