@@ -64,6 +64,19 @@
 #      maillog for a day, THEN roll to the fleet. postscreen edits
 #      master.cf (the riskiest change) — prefer a low-traffic window.
 #
+#  v1.0.2 (2026-06-06) — CRITICAL restriction-list fix + postgrey start fix.
+#    (a) The token-list helper normalized commas→spaces then spaces→commas,
+#        which SPLIT multi-word entries like `check_policy_service inet:...`
+#        and `reject_rbl_client zen.spamhaus.org` into two broken tokens —
+#        mangling CWP's Policyd + RBL lines. Replaced with comma-only
+#        `pc_append_one` / `pc_harden_list` (+ matching `pc_one`/`pc_hard`
+#        in the heal cron) that never split on an inner space.
+#    (b) postgrey now runs FOREGROUND (Type=simple, no -d, no PIDFile): the
+#        stock unit is Type=forking w/ PIDFile=/var/run/postgrey.pid and a
+#        PID-path mismatch made systemd time out + kill it in a restart loop,
+#        even though it bound to :10023 fine.
+#    Restore the pre-run main.cf backup and re-run `all` on any box that ran
+#    v1.0–v1.0.1 (their recipient_restrictions are mangled).
 #  v1.0.1 (2026-06-06) — greylist robustness (first live deploy on
 #    biswashost). postgrey now runs in INET mode via a systemd drop-in
 #    (unix-socket mode silently failed to start on CWP). Added
@@ -167,30 +180,55 @@ pc_set() {
   fi
   return 1
 }
-pc_append_tokens() {
-  # pc_append_tokens KEY "tok1 tok2 ..." [lead]
-  #   Append each token to a postconf comma-list IFF absent. Preserves
-  #   existing entries (Policyd, reject_unauth_destination, opendkim…).
-  #   If 'lead' given, ensures it sits at the FRONT (permit_mynetworks).
-  local key="$1" toks="$2" lead="${3:-}" cur t newlist changed=0
-  cur="$(pc_get "$key")"
-  cur="$(echo "$cur" | tr ',' ' ' | tr -s ' ')"   # normalize to space list
-  newlist="$cur"
+_pc_entries() {
+  # Split a postconf restriction list into one ENTRY per line, splitting on
+  # COMMA ONLY. Postfix entries like `check_policy_service inet:127.0.0.1:10031`
+  # and `reject_rbl_client zen.spamhaus.org` contain a space between the
+  # keyword and its argument — that space must NOT be treated as a separator.
+  # (The original helper did `tr ' ' ', '` and split those in half, mangling
+  #  Policyd + RBL entries. This is the v1.0.2 fix.)
+  pc_get "$1" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' || true
+}
+_pc_write() {
+  # rejoin entries (one per line on stdin) into a comma-space postconf value
+  local key="$1" joined
+  joined="$(grep -v '^$' | paste -sd, - | sed 's/,/, /g')"
+  "$POSTCONF" -e "$key=$joined"
+  logf "main.cf set $key -> $joined"
+}
+
+pc_append_one() {
+  # pc_append_one KEY "entry"  — append ONE entry (may contain a space, e.g.
+  # 'check_policy_service inet:127.0.0.1:10023' or 'inet:127.0.0.1:8893') at
+  # the END iff absent. Exact whole-entry match, never splits on inner space.
+  local key="$1" entry="$2" entries
+  entries="$(_pc_entries "$key")"
+  printf '%s\n' "$entries" | grep -qxF "$entry" && return 1
+  printf '%s\n%s\n' "$entries" "$entry" | _pc_write "$key"
+  return 0
+}
+
+pc_harden_list() {
+  # pc_harden_list KEY "reject_tok1 reject_tok2 ..."
+  #   Append single-word reject tokens at the END iff absent. If the list has
+  #   NEITHER permit_mynetworks NOR permit_sasl_authenticated, prepend both so
+  #   auth/local senders are permitted BEFORE hitting the new rejects (matters
+  #   for empty helo/sender lists). Existing entries are NEVER reordered — so
+  #   CWP's Policyd-first ordering in recipient_restrictions is preserved.
+  local key="$1" toks="$2" entries t changed=0
+  entries="$(_pc_entries "$key")"
+  if ! printf '%s\n' "$entries" | grep -qxE 'permit_mynetworks|permit_sasl_authenticated'; then
+    entries="$(printf 'permit_mynetworks\npermit_sasl_authenticated\n%s' "$entries")"
+    changed=1
+  fi
   for t in $toks; do
-    if ! echo " $newlist " | grep -qF " $t "; then
-      newlist="$newlist $t"; changed=1
+    if ! printf '%s\n' "$entries" | grep -qxF "$t"; then
+      entries="$(printf '%s\n%s' "$entries" "$t")"; changed=1
     fi
   done
-  if [ -n "$lead" ] && ! echo "$newlist" | grep -qE "^[[:space:]]*$lead([[:space:]]|$)"; then
-    newlist="$lead $(echo " $newlist " | sed "s/ $lead / /")"; changed=1
-  fi
-  if [ "$changed" = "1" ]; then
-    newlist="$(echo "$newlist" | sed 's/^ *//; s/ *$//' | sed 's/ /, /g')"
-    "$POSTCONF" -e "$key=$newlist"
-    logf "main.cf append $key -> $newlist"
-    return 0
-  fi
-  return 1
+  [ "$changed" = "1" ] || return 1
+  printf '%s\n' "$entries" | _pc_write "$key"
+  return 0
 }
 
 pc_strip_token() {
@@ -322,28 +360,25 @@ phase_restrictions() {
 
   pc_set smtpd_helo_required "yes" || true
 
-  # permit_mynetworks + permit_sasl_authenticated lead every list so
-  # localhost + logged-in users are NEVER subject to these rejects.
-  # reject_* rules only bite anonymous inbound. Appended, never replaced,
-  # so CWP's reject_unauth_destination + Policyd survive.
-  pc_append_tokens smtpd_helo_restrictions \
-    "permit_sasl_authenticated reject_invalid_helo_hostname reject_non_fqdn_helo_hostname" \
-    "permit_mynetworks" || true
+  # pc_harden_list ensures permit_mynetworks + permit_sasl_authenticated lead
+  # any list lacking them (so localhost + logged-in users are permitted before
+  # the rejects), then APPENDS the reject tokens at the END. Existing entries
+  # are never reordered — CWP's reject_unauth_destination + Policyd survive.
+  pc_harden_list smtpd_helo_restrictions \
+    "reject_invalid_helo_hostname reject_non_fqdn_helo_hostname" || true
   ok "HELO restrictions: invalid/non-FQDN HELO rejected"
 
-  pc_append_tokens smtpd_sender_restrictions \
-    "permit_sasl_authenticated reject_non_fqdn_sender reject_unknown_sender_domain" \
-    "permit_mynetworks" || true
+  pc_harden_list smtpd_sender_restrictions \
+    "reject_non_fqdn_sender reject_unknown_sender_domain" || true
   ok "Sender restrictions: non-FQDN + unknown-domain senders rejected"
 
-  # recipient: add reverse-DNS reject (moderate — uses PTR existence, not
-  # strict FCrDNS) at the END so it runs after permit + anti-relay rules.
-  pc_append_tokens smtpd_recipient_restrictions \
-    "reject_non_fqdn_recipient reject_unknown_recipient_domain reject_unauth_destination reject_unknown_reverse_client_hostname" \
-    "permit_mynetworks" || true
+  # recipient: reverse-DNS reject (moderate — PTR existence, not strict FCrDNS)
+  # appended at the END so it runs after permit + anti-relay rules.
+  pc_harden_list smtpd_recipient_restrictions \
+    "reject_non_fqdn_recipient reject_unknown_recipient_domain reject_unauth_destination reject_unknown_reverse_client_hostname" || true
   ok "Recipient restrictions: FQDN + reverse-DNS checks (anti-relay preserved)"
 
-  pc_append_tokens smtpd_data_restrictions "reject_unauth_pipelining" || true
+  pc_harden_list smtpd_data_restrictions "reject_unauth_pipelining" || true
   ok "Data restrictions: reject_unauth_pipelining (early-talker spambots)"
 
   validate_and_reload
@@ -393,20 +428,27 @@ WL
   ok "ESP/provider whitelist written: $wlf"
 
   # Run postgrey in INET mode via a systemd drop-in. On CWP this is far more
-  # robust than the unix socket — the unix-socket mode silently failed to
-  # start on the first biswashost deploy (chroot/SELinux/socket-dir pitfalls).
-  # postgrey auto-reads BOTH postgrey_whitelist_clients and *.local, so the
-  # ESP whitelist above is picked up without a flag.
-  mkdir -p /var/run/postgrey && chown postgrey:postgrey /var/run/postgrey 2>/dev/null || true
+  # robust than the unix socket (which silently failed — chroot/SELinux). We
+  # run it FOREGROUND as Type=simple (drop -d, clear PIDFile): the stock unit
+  # is Type=forking + PIDFile=/var/run/postgrey.pid, and any PID-file path
+  # mismatch makes systemd time out + kill it in a restart loop. Foreground
+  # sidesteps the whole PID-file dance. postgrey auto-reads both
+  # postgrey_whitelist_clients and *.local, so our ESP whitelist is picked up.
   mkdir -p /etc/systemd/system/postgrey.service.d
   cat > /etc/systemd/system/postgrey.service.d/bh-override.conf <<EOF
 [Service]
+Type=simple
+PIDFile=
 ExecStart=
-ExecStart=/usr/sbin/postgrey --inet=127.0.0.1:$POSTGREY_PORT --delay=$GREYLIST_DELAY --max-age=$GREYLIST_MAX_AGE --pidfile=/var/run/postgrey/postgrey.pid -d
+ExecStart=/usr/sbin/postgrey --inet=127.0.0.1:$POSTGREY_PORT --delay=$GREYLIST_DELAY --max-age=$GREYLIST_MAX_AGE
+Restart=on-failure
+RestartSec=2
 EOF
   systemctl daemon-reload
+  systemctl reset-failed postgrey >/dev/null 2>&1 || true
   systemctl enable postgrey >/dev/null 2>&1 || true
   systemctl restart postgrey 2>/dev/null || systemctl start postgrey 2>/dev/null || true
+  sleep 2
   if ss -ltn 2>/dev/null | grep -q "127.0.0.1:$POSTGREY_PORT\b"; then
     ok "postgrey listening on 127.0.0.1:$POSTGREY_PORT (delay=${GREYLIST_DELAY}s, max-age=${GREYLIST_MAX_AGE}d)"
   else
@@ -421,7 +463,8 @@ EOF
   # Drop any stale unix-socket policy line from an earlier run (we use inet now).
   pc_strip_token smtpd_recipient_restrictions "check_policy_service unix:postgrey/socket"
   # Wire into recipient restrictions at the END (after anti-relay). Always inet.
-  pc_append_tokens smtpd_recipient_restrictions "check_policy_service inet:127.0.0.1:$POSTGREY_PORT" || true
+  # pc_append_one keeps 'check_policy_service inet:...' as ONE entry.
+  pc_append_one smtpd_recipient_restrictions "check_policy_service inet:127.0.0.1:$POSTGREY_PORT" || true
   ok "greylisting wired (inet:127.0.0.1:$POSTGREY_PORT) — fail-open enabled"
 
   validate_and_reload
@@ -467,8 +510,8 @@ EOF
 
   # APPEND to smtpd_milters (do NOT clobber opendkim's milter)
   backup_once "$MAIN_CF"
-  pc_append_tokens smtpd_milters "inet:127.0.0.1:$OPENDMARC_PORT" || true
-  pc_append_tokens non_smtpd_milters "inet:127.0.0.1:$OPENDMARC_PORT" || true
+  pc_append_one smtpd_milters "inet:127.0.0.1:$OPENDMARC_PORT" || true
+  pc_append_one non_smtpd_milters "inet:127.0.0.1:$OPENDMARC_PORT" || true
   pc_set milter_default_action "accept" || true   # never block mail if milter is down
   ok "opendmarc milter appended (opendkim preserved); fail-open if milter down"
 
@@ -594,13 +637,21 @@ log(){ echo "[$(date '+%F %T')] heal: $*" >> "$LOG"; }
 
 pc_get(){ "$POSTCONF" -h "$1" 2>/dev/null; }
 pc_set(){ local k="$1" v="$2"; [ "$(pc_get "$k")" = "$v" ] || { "$POSTCONF" -e "$k=$v"; CHANGED=1; log "set $k"; }; }
-pc_app(){ # key "tokens" [lead]
-  local key="$1" toks="$2" lead="${3:-}" cur t nl chg=0
-  cur="$(pc_get "$key" | tr ',' ' ' | tr -s ' ')"; nl="$cur"
-  for t in $toks; do echo " $nl " | grep -qF " $t " || { nl="$nl $t"; chg=1; }; done
-  if [ -n "$lead" ] && ! echo "$nl" | grep -qE "^[[:space:]]*$lead([[:space:]]|$)"; then
-    nl="$lead $(echo " $nl " | sed "s/ $lead / /")"; chg=1; fi
-  [ "$chg" = 1 ] && { nl="$(echo "$nl" | sed 's/^ *//;s/ *$//;s/ /, /g')"; "$POSTCONF" -e "$key=$nl"; CHANGED=1; log "append $key"; }
+# Split on COMMA only — Postfix entries like 'check_policy_service inet:...'
+# contain an inner space that must NOT be treated as a separator.
+_ent(){ pc_get "$1" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' || true; }
+_wr(){ local k="$1" j; j="$(grep -v '^$' | paste -sd, - | sed 's/,/, /g')"; "$POSTCONF" -e "$k=$j"; CHANGED=1; log "set $k"; }
+pc_one(){ # append ONE (possibly multi-word) entry at END iff absent
+  local key="$1" entry="$2" e; e="$(_ent "$key")"
+  printf '%s\n' "$e" | grep -qxF "$entry" && return 0
+  printf '%s\n%s\n' "$e" "$entry" | _wr "$key"
+}
+pc_hard(){ # ensure permit_* lead a permit-less list, append single-word rejects
+  local key="$1" toks="$2" e t chg=0; e="$(_ent "$key")"
+  if ! printf '%s\n' "$e" | grep -qxE 'permit_mynetworks|permit_sasl_authenticated'; then
+    e="$(printf 'permit_mynetworks\npermit_sasl_authenticated\n%s' "$e")"; chg=1; fi
+  for t in $toks; do printf '%s\n' "$e" | grep -qxF "$t" || { e="$(printf '%s\n%s' "$e" "$t")"; chg=1; }; done
+  [ "$chg" = 1 ] && printf '%s\n' "$e" | _wr "$key"
 }
 
 # master.cf postscreen block
@@ -622,10 +673,10 @@ pc_set postscreen_dnsbl_sites "zen.spamhaus.org*3 bl.spamcop.net*2 b.barracudace
 
 # restrictions
 pc_set smtpd_helo_required yes
-pc_app smtpd_helo_restrictions "permit_sasl_authenticated reject_invalid_helo_hostname reject_non_fqdn_helo_hostname" permit_mynetworks
-pc_app smtpd_sender_restrictions "permit_sasl_authenticated reject_non_fqdn_sender reject_unknown_sender_domain" permit_mynetworks
-pc_app smtpd_recipient_restrictions "reject_non_fqdn_recipient reject_unknown_recipient_domain reject_unauth_destination reject_unknown_reverse_client_hostname" permit_mynetworks
-pc_app smtpd_data_restrictions "reject_unauth_pipelining"
+pc_hard smtpd_helo_restrictions "reject_invalid_helo_hostname reject_non_fqdn_helo_hostname"
+pc_hard smtpd_sender_restrictions "reject_non_fqdn_sender reject_unknown_sender_domain"
+pc_hard smtpd_recipient_restrictions "reject_non_fqdn_recipient reject_unknown_recipient_domain reject_unauth_destination reject_unknown_reverse_client_hostname"
+pc_hard smtpd_data_restrictions "reject_unauth_pipelining"
 
 # greylist policy service (always inet; fail-open so a dead service never defers mail)
 if [ "${HAS_POSTGREY:-0}" = "1" ]; then
@@ -636,13 +687,13 @@ if [ "${HAS_POSTGREY:-0}" = "1" ]; then
     NL="$(pc_get smtpd_recipient_restrictions | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -vxF "check_policy_service unix:postgrey/socket" | paste -sd, - | sed 's/,/, /g')"
     "$POSTCONF" -e "smtpd_recipient_restrictions=$NL"; CHANGED=1; log "stripped stale unix postgrey socket"
   fi
-  pc_app smtpd_recipient_restrictions "check_policy_service inet:127.0.0.1:$PGP"
+  pc_one smtpd_recipient_restrictions "check_policy_service inet:127.0.0.1:$PGP"
 fi
 
 # dmarc milter
 if [ "${HAS_OPENDMARC:-0}" = "1" ]; then
-  pc_app smtpd_milters "inet:127.0.0.1:${OPENDMARC_PORT:-8893}"
-  pc_app non_smtpd_milters "inet:127.0.0.1:${OPENDMARC_PORT:-8893}"
+  pc_one smtpd_milters "inet:127.0.0.1:${OPENDMARC_PORT:-8893}"
+  pc_one non_smtpd_milters "inet:127.0.0.1:${OPENDMARC_PORT:-8893}"
   pc_set milter_default_action accept
 fi
 
