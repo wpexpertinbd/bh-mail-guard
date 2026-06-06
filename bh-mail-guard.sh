@@ -64,6 +64,11 @@
 #      maillog for a day, THEN roll to the fleet. postscreen edits
 #      master.cf (the riskiest change) — prefer a low-traffic window.
 #
+#  v1.0.6 (2026-06-06) — KAM network calls can no longer hang the deploy.
+#    Added curl --connect-timeout/--max-time + wget --timeout on the key
+#    fetch, and `timeout 180` on sa-update (hit on s4 — a slow route to
+#    mcgrail.com stalled the whole run). A timeout now just skips KAM
+#    (bonus-only) and the deploy continues.
 #  v1.0.5 (2026-06-06) — fix KAM key URL. McGrail renamed the key in 2026;
 #    the old downloads/MCGRAIL-GPG.KEY now 404s (confirmed on the fleet).
 #    Correct URL: downloads/kam.sa-channels.mcgrail.com.key (key id 24C063D8,
@@ -586,8 +591,10 @@ SACF
       local kamkey=/tmp/bhmg-kam.key kam_ok=0
       # McGrail renamed the key file in 2026 (old MCGRAIL-GPG.KEY now 404).
       local kamurl="https://mcgrail.com/downloads/kam.sa-channels.mcgrail.com.key"
-      curl -fsSL --retry 3 "$kamurl" -o "$kamkey" 2>/tmp/bhmg-kam.err \
-        || wget -qO "$kamkey" "$kamurl" 2>>/tmp/bhmg-kam.err || true
+      # timeouts are essential — without them a slow/stalled route to mcgrail.com
+      # hangs the whole deploy (hit on s4). curl: 10s connect / 60s total.
+      curl -fsSL --connect-timeout 10 --max-time 60 --retry 2 "$kamurl" -o "$kamkey" 2>/tmp/bhmg-kam.err \
+        || wget -q --timeout=20 --tries=2 -O "$kamkey" "$kamurl" 2>>/tmp/bhmg-kam.err || true
       if grep -q 'BEGIN PGP' "$kamkey" 2>/dev/null; then
         if sa-update --import "$kamkey" 2>/tmp/bhmg-kam.err; then
           ok "imported KAM GPG key (24C063D8)"; kam_ok=1
@@ -600,9 +607,12 @@ SACF
       fi
       if [ "$kam_ok" = "1" ]; then
         local rc=0
-        # `|| rc=$?` keeps set -e from aborting on the expected exit 1
-        sa-update --gpgkey 24C063D8 --channel kam.sa-channels.mcgrail.com --channel updates.spamassassin.org 2>/tmp/bhmg-kam.err || rc=$?
+        # `|| rc=$?` keeps set -e from aborting on the expected exit 1.
+        # `timeout 180` stops a slow channel mirror from hanging the deploy
+        # (rc=124 = timed out → reported as a failure, deploy continues).
+        timeout 180 sa-update --gpgkey 24C063D8 --channel kam.sa-channels.mcgrail.com --channel updates.spamassassin.org 2>/tmp/bhmg-kam.err || rc=$?
         if [ "$rc" -le 1 ]; then ok "sa-update ran KAM + default channels (rc=$rc: $([ "$rc" = 0 ] && echo updated || echo up-to-date))"
+        elif [ "$rc" = 124 ]; then warn "sa-update timed out (slow channel mirror) — KAM skipped this run, retry later"
         else err "sa-update failed (rc=$rc):"; sed 's/^/      /' /tmp/bhmg-kam.err >&2 || true; fi
       fi
     else
