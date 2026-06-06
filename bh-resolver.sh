@@ -40,7 +40,20 @@
 #               can't overwrite it (rollback clears it). Default 0.
 #    UB_ADDR=127.0.0.53   loopback address unbound binds (default).
 #
+#  ⚠️  CWP AutoSSL CAVEAT (important): on CWP servers that issue Let's Encrypt
+#      AutoSSL for hosted/customer domains, a LOCAL RECURSIVE resolver can
+#      break CWP's "domain resolves to this server IP" pre-check (DNSSEC
+#      SERVFAIL / slower cold recursion vs Google's instant cached answer) →
+#      AutoSSL fails from the cwp/user panel. If a box issues AutoSSL, DON'T
+#      run the local resolver there — `bash bh-resolver.sh rollback` reverts
+#      it to the public resolvers. The postscreen DNSBL layer is then inert,
+#      but the other five mail-guard layers are unaffected. (Confirmed on the
+#      bitsboxhost shared-hosting fleet, 2026-06-06.)
+#
 #  Idempotent. Safe to re-run. Pairs with bh-mail-guard.sh.
+#  v1.0.2 (2026-06-06) — deterministic rollback (strip the 127.0.0.53 line +
+#    keep real nameservers, instead of restoring a possibly-unbound backup);
+#    documented the CWP AutoSSL caveat above + warn on install.
 #  v1.0.1 (2026-06-06) — a plain re-run no longer un-sticks resolv.conf: if it
 #    was already immutable, the lock is preserved even without STICKY=1.
 #  v1.0 (2026-06-06)
@@ -215,6 +228,10 @@ phase_install() {
   else
     warn "system DNSBL test still empty — re-run 'bash $0 detect' in a minute to recheck"
   fi
+  echo
+  warn "CWP AutoSSL: if this box issues Let's Encrypt AutoSSL for hosted domains,"
+  warn "a local recursive resolver can break CWP's domain-resolve check → SSL fails."
+  warn "If AutoSSL stops working, revert with:  bash $0 rollback"
   say "  Rollback: bash $0 rollback"
 }
 
@@ -230,15 +247,30 @@ phase_status() {
 }
 
 phase_rollback() {
-  hdr "ROLLBACK — restore previous resolver"
+  hdr "ROLLBACK — take unbound out of the resolver path"
   chattr -i "$RESOLV" 2>/dev/null || true
-  local bak; bak="$(ls -1t ${RESOLV}.bh-bak-* 2>/dev/null | head -1)"
-  if [ -n "$bak" ]; then cp -a "$bak" "$RESOLV"; ok "restored $RESOLV from $bak"
-  else warn "no resolv.conf backup found — leaving $RESOLV as-is"; fi
+  # Deterministic: keep the REAL nameservers (the public fallbacks we
+  # preserved) and just drop our 127.0.0.53 line. Safer than restoring a
+  # backup — a later install backed up an already-unbound resolv.conf, so the
+  # newest .bh-bak can itself point at unbound.
+  local remaining
+  remaining="$(current_ns | grep -v "^${UB_ADDR}$" || true)"
+  if [ -z "$remaining" ]; then
+    # nothing left in current file — try the OLDEST backup (true original)
+    local bak; bak="$(ls -1tr ${RESOLV}.bh-bak-* 2>/dev/null | head -1)"
+    [ -n "$bak" ] && remaining="$(grep -E '^[[:space:]]*nameserver' "$bak" | awk '{print $2}' | grep -v "^${UB_ADDR}$")"
+    [ -z "$remaining" ] && remaining=$'8.8.8.8\n8.8.4.4'   # last-resort public
+  fi
+  { echo "# restored by bh-resolver.sh rollback — unbound removed from path"
+    for ns in $remaining; do echo "nameserver $ns"; done
+    echo "options edns0"; } > "$RESOLV"
+  ok "resolv.conf nameservers now: $(echo $remaining | tr '\n' ' ')"
   rm -f "$DROPIN" && ok "removed unbound drop-in"
   systemctl stop unbound 2>/dev/null || true
   systemctl disable unbound >/dev/null 2>&1 || true
   ok "unbound stopped + disabled (package left installed; 'yum remove unbound' to purge)"
+  systemctl reload postfix 2>/dev/null || true
+  warn "postscreen DNSBL scoring is now INERT (public resolver). Other layers unaffected."
   say "Verify DNS still works: dig +short google.com"
 }
 

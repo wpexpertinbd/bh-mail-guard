@@ -103,6 +103,17 @@ everything):
 
 If `detect` shows DNSBL lookups already work on a box, no change is needed there.
 
+> ### ⚠️ CWP AutoSSL caveat — do not run the resolver on boxes that issue AutoSSL
+> On CWP servers that issue Let's Encrypt **AutoSSL** for hosted/customer
+> domains, a local recursive resolver can **break CWP's "domain resolves to
+> this server IP" check** (DNSSEC SERVFAIL / slower cold recursion vs Google's
+> instant cached answer) → AutoSSL fails from the cwp/user panel. If a box
+> issues AutoSSL, **don't use the local resolver there** — revert with
+> `bash bh-resolver.sh rollback` (restores `8.8.8.8`/`8.8.4.4`). The postscreen
+> DNSBL layer then goes inert, but the other five mail-guard layers
+> (postscreen pregreet, restrictions, greylist, DMARC, SpamAssassin/KAM) are
+> unaffected. Confirmed on the shared-hosting fleet, 2026-06.
+
 ## Full deploy — one block per box (mail guard + resolver + KAM)
 
 The complete fleet rollout for a box: clone (or pull), install the locked
