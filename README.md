@@ -64,6 +64,35 @@ cd bh-mail-guard && bash bh-mail-guard.sh detect && bash bh-mail-guard.sh all -y
 tested on one box. Run individual phases too: `postscreen`, `restrictions`,
 `greylist`, `dmarc`, `sa-tune`, `heal-install`, `status`.
 
+## Companion: `bh-resolver.sh` (makes the DNSBL layer actually work)
+
+Spamhaus and most DNSBLs **refuse queries from big public resolvers**
+(`8.8.8.8` / `1.1.1.1`) — they silently return nothing. So if `/etc/resolv.conf`
+points at one, postscreen's DNSBL scoring is inert (`postscreen DNSBL rejects`
+stays `0`). `bh-resolver.sh` installs a local **unbound** caching resolver so
+DNSBL lookups resolve and botnets get rejected at connect time — the cheapest
+layer of all.
+
+```bash
+bash bh-resolver.sh detect      # read-only: live DNSBL test on the current resolver
+bash bh-resolver.sh install     # install unbound + repoint resolv.conf (interactive)
+bash bh-resolver.sh status
+bash bh-resolver.sh rollback    # restore previous resolver
+```
+
+Safety (it's the scariest change on a live box — break the resolver, break
+everything):
+- Binds unbound to **`127.0.0.53:53`**, never `127.0.0.1` — so it never
+  collides with CWP's `named`/BIND on `127.0.0.1:53`.
+- **Tests that unbound resolves a normal name AND a Spamhaus test entry BEFORE
+  touching `resolv.conf`** — aborts if it can't, so DNS never breaks.
+- Backs up `resolv.conf` and keeps your old resolver as a **fallback line**
+  (used only if unbound is down).
+- `STICKY=1` makes `resolv.conf` immutable (`chattr +i`) so NetworkManager /
+  dhclient can't revert it; `rollback` clears it. Default off.
+
+If `detect` shows DNSBL lookups already work on a box, no change is needed there.
+
 ### Env toggles
 
 | Var | Default | Effect |

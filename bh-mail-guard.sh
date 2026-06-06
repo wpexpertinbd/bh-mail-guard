@@ -64,6 +64,13 @@
 #      maillog for a day, THEN roll to the fleet. postscreen edits
 #      master.cf (the riskiest change) — prefer a low-traffic window.
 #
+#  v1.0.4 (2026-06-06) — robust + self-diagnosing KAM ruleset import. Now
+#    validates the downloaded key is a real PGP block (a 404 HTML page was
+#    silently breaking --import), captures + prints the real error, and
+#    treats `sa-update` exit 1 as SUCCESS ("no new rules" — only >=2 is a
+#    real failure). Guarded against set -e. Companion `bh-resolver.sh` added
+#    to the repo to install a local unbound resolver so the postscreen DNSBL
+#    layer actually scores (Spamhaus ignores public resolvers).
 #  v1.0.3 (2026-06-06) — status display fixes (cosmetic). grep -c already
 #    prints 0 on no match, so the `|| echo 0` double-printed; replaced with a
 #    `cnt()` helper (`|| true`). Top-rejected-IPs now scans ALL reject layers
@@ -565,15 +572,33 @@ rewrite_header Subject  [SPAM]
 SACF
   ok "wrote $SA_CF (Bayes + network tests + DMARC scoring)"
 
-  # KAM ruleset channel (high-quality community rules, big accuracy boost)
+  # KAM ruleset channel (high-quality community rules, big accuracy boost).
+  # Robust + self-diagnosing: validate the downloaded key is a real PGP block
+  # (a 404 HTML page silently breaks --import), capture real errors, and treat
+  # sa-update exit 1 as SUCCESS — it means "no new rules", not an error
+  # (only exit >=4 is a real failure; 1 = up-to-date, 0 = updated).
   if [ "$INSTALL_KAM" = "1" ]; then
     if command -v sa-update >/dev/null 2>&1; then
-      curl -fsSL https://mcgrail.com/downloads/MCGRAIL-GPG.KEY -o /tmp/kam.key 2>/dev/null \
-        && sa-update --import /tmp/kam.key >/dev/null 2>&1 \
-        && ok "imported KAM GPG key" || warn "KAM GPG key import failed (rules still update from default channel)"
-      sa-update --gpgkey 24C063D8 --channel kam.sa-channels.mcgrail.com --channel updates.spamassassin.org >/dev/null 2>&1 \
-        && ok "sa-update ran (KAM + default channels)" \
-        || warn "sa-update returned non-zero (often just 'no updates') — continuing"
+      local kamkey=/tmp/bhmg-kam.key kam_ok=0
+      curl -fsSL --retry 3 https://mcgrail.com/downloads/MCGRAIL-GPG.KEY -o "$kamkey" 2>/tmp/bhmg-kam.err \
+        || wget -qO "$kamkey" https://mcgrail.com/downloads/MCGRAIL-GPG.KEY 2>>/tmp/bhmg-kam.err || true
+      if grep -q 'BEGIN PGP' "$kamkey" 2>/dev/null; then
+        if sa-update --import "$kamkey" 2>/tmp/bhmg-kam.err; then
+          ok "imported KAM GPG key (24C063D8)"; kam_ok=1
+        else
+          warn "KAM key import failed: $(tail -1 /tmp/bhmg-kam.err 2>/dev/null)"
+        fi
+      else
+        warn "KAM key download did not return a PGP key (URL blocked/404?) — skipping KAM channel"
+        warn "  first line got: $(head -1 "$kamkey" 2>/dev/null | cut -c1-60)"
+      fi
+      if [ "$kam_ok" = "1" ]; then
+        local rc=0
+        # `|| rc=$?` keeps set -e from aborting on the expected exit 1
+        sa-update --gpgkey 24C063D8 --channel kam.sa-channels.mcgrail.com --channel updates.spamassassin.org 2>/tmp/bhmg-kam.err || rc=$?
+        if [ "$rc" -le 1 ]; then ok "sa-update ran KAM + default channels (rc=$rc: $([ "$rc" = 0 ] && echo updated || echo up-to-date))"
+        else err "sa-update failed (rc=$rc):"; sed 's/^/      /' /tmp/bhmg-kam.err >&2 || true; fi
+      fi
     else
       warn "sa-update not found — skipping KAM channel"
     fi
