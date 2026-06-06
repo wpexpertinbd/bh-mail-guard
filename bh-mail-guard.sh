@@ -59,11 +59,19 @@
 #                            (default 0 = mark only — much safer)
 #    INSTALL_KAM=1           add KAM SpamAssassin ruleset channel
 #    DNSBL_THRESHOLD=3       postscreen score needed to reject
+#    ENABLE_HASHBL=0         skip enabling the SpamAssassin HashBL plugin
+#                            (default 1 = uncomment its stub in v342.pre so
+#                            KAM's hashbl rules fire + lint is clean)
 #
 #  ⚠️  Run `detect` first. Deploy on ONE server, watch `status` +
 #      maillog for a day, THEN roll to the fleet. postscreen edits
 #      master.cf (the riskiest change) — prefer a low-traffic window.
 #
+#  v1.0.8 (2026-06-06) — sa-tune auto-enables the HashBL plugin (uncomments
+#    the commented stub CWP ships in v342.pre) so KAM's hashbl rules fire and
+#    `spamassassin --lint` is clean — no more "unknown eval check_hashbl_emails"
+#    warnings. Only uncomments an existing stub (never adds a loadplugin for a
+#    missing module). Toggle off with ENABLE_HASHBL=0.
 #  v1.0.7 (2026-06-06) — sa-tune now VERIFIES amavisd actually started after
 #    the restart (it used to print "restarted" blindly). On IPv6-disabled CWP
 #    boxes amavis 2.13 fails to bind ::1:10024 and stays down silently while
@@ -585,6 +593,22 @@ required_score          5.0
 rewrite_header Subject  [SPAM]
 SACF
   ok "wrote $SA_CF (Bayes + network tests + DMARC scoring)"
+
+  # Enable the HashBL plugin if SpamAssassin ships it (a commented stub is
+  # present) but it's disabled — CWP ships it commented in v342.pre. Without
+  # it, KAM's hashbl rules throw "unknown eval check_hashbl_emails" lint
+  # warnings and don't fire. We ONLY uncomment an existing stub (never add a
+  # loadplugin for a missing module, which would break lint). HashBL does DNS
+  # lookups — now useful fleet-wide since every box has a local resolver.
+  if [ "${ENABLE_HASHBL:-1}" = "1" ] && [ -d "$SA_DIR" ]; then
+    if ! grep -rqsE '^[[:space:]]*loadplugin[[:space:]]+\S*HashBL' "$SA_DIR"/*.pre 2>/dev/null \
+       && grep -rlqsE '^[[:space:]]*#[[:space:]]*loadplugin[[:space:]]+\S*HashBL' "$SA_DIR"/*.pre 2>/dev/null; then
+      sed -i -E 's|^([[:space:]]*)#[[:space:]]*(loadplugin[[:space:]]+\S*HashBL)|\1\2|' "$SA_DIR"/*.pre
+      ok "enabled HashBL plugin (clears hashbl lint warnings + activates hashbl rules)"
+    else
+      skip "HashBL plugin already enabled or no stub present"
+    fi
+  fi
 
   # KAM ruleset channel (high-quality community rules, big accuracy boost).
   # Robust + self-diagnosing: validate the downloaded key is a real PGP block

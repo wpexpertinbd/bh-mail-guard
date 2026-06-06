@@ -144,6 +144,7 @@ silently revert the DNSBL fix. Everything is idempotent — safe to re-run.
 | `DMARC_REJECT` | `0` | `1` = hard-reject `p=reject` failures (default = mark only, SA scores it) |
 | `INSTALL_KAM` | `1` | add KAM SpamAssassin ruleset channel |
 | `DNSBL_THRESHOLD` | `3` | postscreen score needed to reject |
+| `ENABLE_HASHBL` | `1` | enable the SpamAssassin HashBL plugin (uncomments its stub in `v342.pre`) so KAM's hashbl rules fire and `--lint` is clean; `0` to skip |
 
 ## Safety design
 
